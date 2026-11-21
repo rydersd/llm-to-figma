@@ -48,7 +48,7 @@ export function registerTools(server: McpServer, sendCommandToFigma: SendCommand
 
   server.tool(
     "snapshot_positions",
-    "Record the id, name, parentId and absoluteBoundingBox of a node and its descendants in a plugin-side store, and return its snapshotId. Use before a reparent, auto-layout change or bulk edit, then call diff_positions with that id. Bounded walk (default 2000 nodes, depth 30) with an explicit truncated flag. Snapshots expire after 30 minutes, at most 64 are kept, and all are lost when the plugin reloads.",
+    "Record the id, name, parentId and absoluteBoundingBox of a node and its descendants in a plugin-side store, and return its snapshotId. Use before a reparent, auto-layout change or bulk edit, then call diff_positions with that id. Bounded walk (default 2000 nodes, at most 10000, depth 30). When the walk stops early the result has truncated: true, a note and unreadParents (the nodes whose children were not all read): snapshot those separately or raise maxNodes; a diff cannot call a node added under an unread parent. Snapshots expire after 30 minutes, at most 64 are kept, and all are lost when the plugin reloads.",
     {
       nodeId: z.string().describe("Root of the subtree to record"),
       maxNodes: z.number().int().min(1).max(10000).optional().describe("Node budget including the root (default 2000)"),

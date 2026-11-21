@@ -3,7 +3,7 @@
 // The pure comparisons live in src/shared/verify.ts so the server and later
 // spec-sync commands use the same rules.
 
-import { walkTree, type WalkOptions } from "../../shared/walk";
+import { walkTree, WALK_LIMITS, type WalkOptions } from "../../shared/walk";
 import {
   boxOverflow, CONTAINMENT_TOLERANCE, diffPositionEntries, resizeReadBack, toBox,
   type Box, type PositionEntry, type ResizeReadBack,
@@ -50,6 +50,10 @@ export interface PositionSnapshot {
 export class PositionSnapshotStore {
   static readonly TTL_MS = 30 * 60 * 1000;
   static readonly MAX_ENTRIES = 64;
+  // Total recorded nodes held across all snapshots; the oldest are evicted
+  // first (the newest is always kept), so memory stays bounded however many
+  // large snapshots are taken.
+  static readonly MAX_TOTAL_NODES = 50000;
   private entries = new Map<string, PositionSnapshot>();
   private counter = 0;
   constructor(private now: () => number = Date.now) {}
@@ -62,13 +66,20 @@ export class PositionSnapshotStore {
     const snapshotId = `snap-${++this.counter}-${this.now().toString(36)}`;
     const expiresAt = this.now() + PositionSnapshotStore.TTL_MS;
     this.entries.set(snapshotId, { rootId, entries, truncated, truncatedParentIds, expiresAt, walk });
+    let total = 0;
+    for (const s of this.entries.values()) total += s.entries.length;
+    for (const [id, s] of this.entries) {
+      if (total <= PositionSnapshotStore.MAX_TOTAL_NODES || this.entries.size <= 1) break;
+      this.entries.delete(id);
+      total -= s.entries.length;
+    }
     return { snapshotId, expiresAt };
   }
   get(snapshotId: string): PositionSnapshot {
     this.purge();
     const snapshot = this.entries.get(snapshotId);
     if (!snapshot) {
-      throw new Error(`Snapshot expired: ${snapshotId} is unknown or older than 30 minutes (snapshots are lost when the plugin reloads). Take a new snapshot with snapshot_positions.`);
+      throw new Error(`Snapshot expired: ${snapshotId} is unknown, older than 30 minutes or was dropped to keep plugin memory bounded (snapshots are lost when the plugin reloads). Take a new snapshot with snapshot_positions.`);
     }
     return snapshot;
   }
@@ -100,7 +111,17 @@ export async function snapshotPositions(params: any) {
   const walk = { maxNodes, maxDepth };
   const { entries, truncated, truncatedParentIds } = readSubtree(root, walk);
   const { snapshotId, expiresAt } = snapshotStore.add(root.id, entries, truncated, walk, truncatedParentIds);
-  return { snapshotId, rootId: root.id, count: entries.length, truncated, expiresAt };
+  // A truncated snapshot says so in words and names the parents it stopped
+  // inside, so the caller can snapshot those subtrees on their own.
+  const limit = Math.min(WALK_LIMITS.maxNodes, Math.max(1, Math.floor(maxNodes ?? WALK_LIMITS.defaultNodes)));
+  return {
+    snapshotId, rootId: root.id, count: entries.length, truncated, expiresAt,
+    ...(truncated ? {
+      note: `Truncated: this snapshot recorded ${entries.length} nodes and did not read every descendant (budget ${limit} nodes; the most it can take is ${WALK_LIMITS.maxNodes}). Snapshot the unreadParents separately, or raise maxNodes. A diff against it cannot call a node added when it sits under an unread parent.`,
+      unreadParents: truncatedParentIds.slice(0, LIST_CAP),
+      unreadParentCount: truncatedParentIds.length,
+    } : {}),
+  };
 }
 
 // Whether a node outside a truncated snapshot could have existed unseen when

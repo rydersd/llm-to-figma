@@ -3541,19 +3541,30 @@ Processing annotation ${i + 1}/${annotations.length}:`,
       const snapshotId = `snap-${++this.counter}-${this.now().toString(36)}`;
       const expiresAt = this.now() + _PositionSnapshotStore.TTL_MS;
       this.entries.set(snapshotId, { rootId, entries, truncated, truncatedParentIds, expiresAt, walk });
+      let total = 0;
+      for (const s of this.entries.values()) total += s.entries.length;
+      for (const [id, s] of this.entries) {
+        if (total <= _PositionSnapshotStore.MAX_TOTAL_NODES || this.entries.size <= 1) break;
+        this.entries.delete(id);
+        total -= s.entries.length;
+      }
       return { snapshotId, expiresAt };
     }
     get(snapshotId) {
       this.purge();
       const snapshot2 = this.entries.get(snapshotId);
       if (!snapshot2) {
-        throw new Error(`Snapshot expired: ${snapshotId} is unknown or older than 30 minutes (snapshots are lost when the plugin reloads). Take a new snapshot with snapshot_positions.`);
+        throw new Error(`Snapshot expired: ${snapshotId} is unknown, older than 30 minutes or was dropped to keep plugin memory bounded (snapshots are lost when the plugin reloads). Take a new snapshot with snapshot_positions.`);
       }
       return snapshot2;
     }
   };
   __publicField(_PositionSnapshotStore, "TTL_MS", 30 * 60 * 1e3);
   __publicField(_PositionSnapshotStore, "MAX_ENTRIES", 64);
+  // Total recorded nodes held across all snapshots; the oldest are evicted
+  // first (the newest is always kept), so memory stays bounded however many
+  // large snapshots are taken.
+  __publicField(_PositionSnapshotStore, "MAX_TOTAL_NODES", 5e4);
   var PositionSnapshotStore = _PositionSnapshotStore;
   var snapshotStore = new PositionSnapshotStore();
   var LIST_CAP = 100;
@@ -3577,7 +3588,19 @@ Processing annotation ${i + 1}/${annotations.length}:`,
     const walk = { maxNodes, maxDepth };
     const { entries, truncated, truncatedParentIds } = readSubtree(root, walk);
     const { snapshotId, expiresAt } = snapshotStore.add(root.id, entries, truncated, walk, truncatedParentIds);
-    return { snapshotId, rootId: root.id, count: entries.length, truncated, expiresAt };
+    const limit = Math.min(WALK_LIMITS.maxNodes, Math.max(1, Math.floor(maxNodes ?? WALK_LIMITS.defaultNodes)));
+    return {
+      snapshotId,
+      rootId: root.id,
+      count: entries.length,
+      truncated,
+      expiresAt,
+      ...truncated ? {
+        note: `Truncated: this snapshot recorded ${entries.length} nodes and did not read every descendant (budget ${limit} nodes; the most it can take is ${WALK_LIMITS.maxNodes}). Snapshot the unreadParents separately, or raise maxNodes. A diff against it cannot call a node added when it sits under an unread parent.`,
+        unreadParents: truncatedParentIds.slice(0, LIST_CAP),
+        unreadParentCount: truncatedParentIds.length
+      } : {}
+    };
   }
   function unseenBySnapshot(entry, nowById, snapshotIds, cutOff) {
     let parentId = entry.parentId;
@@ -3745,6 +3768,30 @@ Processing annotation ${i + 1}/${annotations.length}:`,
   }
 
   // src/llm2figma_plugin/src/transforms.ts
+  function copyComponentPropertyReferences(source, clone) {
+    const result = { copied: 0, failed: [] };
+    const walk = (s, c, path) => {
+      const refs = s && s.componentPropertyReferences;
+      if (refs && Object.keys(refs).length > 0) {
+        const have = c && c.componentPropertyReferences || {};
+        const missing = Object.keys(refs).some((k) => have[k] !== refs[k]);
+        if (missing) {
+          try {
+            c.componentPropertyReferences = Object.assign({}, have, refs);
+            result.copied++;
+          } catch (error) {
+            result.failed.push({ path: path.slice(), error: error && error.message ? error.message : String(error) });
+          }
+        }
+      }
+      if (s && c && s.type !== "INSTANCE" && Array.isArray(s.children) && Array.isArray(c.children)) {
+        const n = Math.min(s.children.length, c.children.length);
+        for (let i = 0; i < n; i++) walk(s.children[i], c.children[i], path.concat(i));
+      }
+    };
+    walk(source, clone, []);
+    return result;
+  }
   async function moveNode(params) {
     const { nodeId, x, y } = params || {};
     if (!nodeId) {
@@ -4016,13 +4063,15 @@ Processing annotation ${i + 1}/${annotations.length}:`,
         figma.currentPage.appendChild(clone);
       }
     }
+    const refs = copyComponentPropertyReferences(node, clone);
     return {
       id: clone.id,
       name: clone.name,
       x: "x" in clone ? clone.x : void 0,
       y: "y" in clone ? clone.y : void 0,
       width: "width" in clone ? clone.width : void 0,
-      height: "height" in clone ? clone.height : void 0
+      height: "height" in clone ? clone.height : void 0,
+      ...refs.copied > 0 || refs.failed.length > 0 ? { componentPropertyReferencesCopied: refs.copied, componentPropertyReferencesFailed: refs.failed } : {}
     };
   }
   async function batchClone(params) {
@@ -4071,11 +4120,13 @@ Processing annotation ${i + 1}/${annotations.length}:`,
           clone.name = names[i];
         }
         parent.appendChild(clone);
+        const refs = copyComponentPropertyReferences(node, clone);
         clones.push({
           id: clone.id,
           name: clone.name,
           x: "x" in clone ? clone.x : void 0,
-          y: "y" in clone ? clone.y : void 0
+          y: "y" in clone ? clone.y : void 0,
+          ...refs.copied > 0 || refs.failed.length > 0 ? { componentPropertyReferencesCopied: refs.copied, componentPropertyReferencesFailed: refs.failed } : {}
         });
         successCount++;
       } catch (error) {
@@ -6553,7 +6604,6 @@ Processing annotation ${i + 1}/${annotations.length}:`,
     const page = await loadPage(params.pageId);
     const paints = backgroundToWrite(params.background, params.backgroundPaints);
     const seenNodes = /* @__PURE__ */ new Set();
-    const seenNames = /* @__PURE__ */ new Set();
     const rejected = [];
     const kept = [];
     const dropped = [];
@@ -6563,9 +6613,8 @@ Processing annotation ${i + 1}/${annotations.length}:`,
         dropped.push({ name: flow.name, nodeId: flow.nodeId });
         continue;
       }
-      const problem = seenNames.has(flow.name) ? "flow name used more than once" : seenNodes.has(flow.nodeId) ? "listed more than once" : flowStartProblem(node, page);
+      const problem = seenNodes.has(flow.nodeId) ? "listed more than once" : flowStartProblem(node, page);
       seenNodes.add(flow.nodeId);
-      seenNames.add(flow.name);
       if (problem) rejected.push(`${flow.name} (${flow.nodeId}): ${problem}`);
       else kept.push({ name: flow.name, nodeId: flow.nodeId });
     }
@@ -8320,11 +8369,19 @@ Processing annotation ${i + 1}/${annotations.length}:`,
       appliedCount
     };
   }
+  var DESIGN_QUERY_MAX_MATCHES = 1e3;
+  var DESIGN_QUERY_MAX_PROPERTY_MATCHES = 200;
+  var DESIGN_QUERY_TIMEOUT_MS = 12e4;
   async function designQuery(params) {
     var select = params.select;
     var update = params.update;
     var limit = params.limit;
     var includeProperties = params.includeProperties === true;
+    var matchCap = includeProperties ? DESIGN_QUERY_MAX_PROPERTY_MATCHES : DESIGN_QUERY_MAX_MATCHES;
+    if (limit && limit > matchCap) {
+      throw new Error("design_query limit " + limit + " is above the most one call returns" + (includeProperties ? " with includeProperties" : "") + " (" + matchCap + "). Lower the limit, or narrow select (parentId, type) and query in parts.");
+    }
+    var walkLimit = limit || matchCap + 1;
     var rootNode;
     if (select.parentId) {
       rootNode = await figma.getNodeByIdAsync(select.parentId);
@@ -8358,11 +8415,14 @@ Processing annotation ${i + 1}/${annotations.length}:`,
     var matches = [];
     var totalScanned = 0;
     var startTime = Date.now();
-    var TIMEOUT_MS = 12e4;
+    var timedOut = false;
     async function walkTree2(node, depth) {
       if (depth > maxDepth) return;
-      if (limit && matches.length >= limit) return;
-      if (Date.now() - startTime > TIMEOUT_MS) return;
+      if (matches.length >= walkLimit) return;
+      if (Date.now() - startTime > DESIGN_QUERY_TIMEOUT_MS) {
+        timedOut = true;
+        return;
+      }
       totalScanned++;
       if (totalScanned % 50 === 0) {
         figma.ui.postMessage({
@@ -8426,19 +8486,25 @@ Processing annotation ${i + 1}/${annotations.length}:`,
           }
         }
         if (passed && depth > 0) {
-          if (!limit || matches.length < limit) {
+          if (matches.length < walkLimit) {
             matches.push(node);
           }
         }
       }
       if ("children" in node && node.children) {
         for (var i = 0; i < node.children.length; i++) {
-          if (limit && matches.length >= limit) break;
+          if (matches.length >= walkLimit) break;
           await walkTree2(node.children[i], depth + 1);
         }
       }
     }
     await walkTree2(rootNode, 0);
+    if (!limit && matches.length > matchCap) {
+      throw new Error("design_query matched more than " + matchCap + " nodes" + (includeProperties ? " with includeProperties" : "") + ". Pass a limit, or narrow select (parentId, type, name) and query in parts.");
+    }
+    if (timedOut && update) {
+      throw new Error("design_query ran out of time after scanning " + totalScanned + " nodes, so no update was applied. Narrow select (parentId, type) and run it in parts.");
+    }
     var results = [];
     var updatedCount = 0;
     var failedCount = 0;
@@ -8483,14 +8549,22 @@ Processing annotation ${i + 1}/${annotations.length}:`,
     return {
       totalScanned,
       matched: matches.length,
+      ...timedOut ? { timedOut: true, note: "The scan hit its time limit; matches past the point reached are not listed." } : {},
+      ...limit && matches.length >= limit ? { limitReached: true } : {},
       updated: update ? updatedCount : void 0,
       failed: update ? failedCount : void 0,
       results
     };
   }
-  function safeSerialize(value, depth) {
+  var EVAL_RESULT_MAX_VALUES = 5e4;
+  var EVAL_RESULT_MAX_CHARS = 2e6;
+  function safeSerialize(value, depth, budget) {
     if (depth === void 0) depth = 0;
     if (depth > 20) return "[max depth]";
+    if (budget) {
+      if (--budget.values < 0) throw new Error("figma_eval result is too large (more than " + EVAL_RESULT_MAX_VALUES + " values). Return counts, ids or a summary, or process the nodes in several calls.");
+      if (typeof value === "string" && (budget.chars -= value.length) < 0) throw new Error("figma_eval result is too large (more than " + EVAL_RESULT_MAX_CHARS + " characters of text). Return a summary, or read the text in several calls.");
+    }
     if (value === null || value === void 0) return value;
     var t = typeof value;
     if (t === "string" || t === "number" || t === "boolean") return value;
@@ -8502,13 +8576,13 @@ Processing annotation ${i + 1}/${annotations.length}:`,
     }
     if (Array.isArray(value)) {
       return value.map(function(item) {
-        return safeSerialize(item, depth + 1);
+        return safeSerialize(item, depth + 1, budget);
       });
     }
     if (t === "object") {
       var result = {};
       for (var key in value) {
-        if (value.hasOwnProperty(key)) result[key] = safeSerialize(value[key], depth + 1);
+        if (value.hasOwnProperty(key)) result[key] = safeSerialize(value[key], depth + 1, budget);
       }
       return result;
     }
@@ -8545,7 +8619,7 @@ Processing annotation ${i + 1}/${annotations.length}:`,
         setProperties,
         resizeWithReadBack
       );
-      return { success: true, result: safeSerialize(rawResult) };
+      return { success: true, result: safeSerialize(rawResult, 0, { values: EVAL_RESULT_MAX_VALUES, chars: EVAL_RESULT_MAX_CHARS }) };
     } catch (error) {
       return { success: false, error: formatError(error) };
     }
@@ -10743,6 +10817,23 @@ Processing annotation ${i + 1}/${annotations.length}:`,
     for (let n = node.parent; n && n !== frame; n = n.parent) if (n.type === "INSTANCE") return true;
     return false;
   }
+  var OVERHANG_SCAN_LIMIT = 5e3;
+  function collectOverhang(frame, frameBox) {
+    const boxes = [];
+    const stack = [...frame.children || []];
+    let scanned = 0;
+    while (stack.length) {
+      const n = stack.pop();
+      if (n.visible === false) continue;
+      if (++scanned > OVERHANG_SCAN_LIMIT) return { boxes, truncated: true };
+      if (n.type !== "GROUP" && n.type !== "BOOLEAN_OPERATION") {
+        const b = boxOf(n);
+        if (b && (b.x < frameBox.x - 0.5 || b.y < frameBox.y - 0.5 || b.x + b.width > frameBox.x + frameBox.width + 0.5 || b.y + b.height > frameBox.y + frameBox.height + 0.5)) boxes.push(b);
+      }
+      if (n.children) for (const c of n.children) stack.push(c);
+    }
+    return { boxes, truncated: false };
+  }
   function intersect(a, b) {
     const x = Math.max(a.x, b.x), y = Math.max(a.y, b.y);
     const r = Math.min(a.x + a.width, b.x + b.width), btm = Math.min(a.y + a.height, b.y + b.height);
@@ -10779,13 +10870,11 @@ Processing annotation ${i + 1}/${annotations.length}:`,
       const box = node ? boxOf(node) : null;
       if (!node) unresolved.push({ key, reason: "target not found" });
       else if (!isInside(node, frame)) unresolved.push({ key, reason: "target not in frame" });
-      else if (inInstance(node, frame)) {
-        throw new Error(`callout ${key}: target ${c.targetId} is inside an instance; point the callout at the instance itself (or detach it)`);
-      } else if (!box) unresolved.push({ key, reason: "target has no bounding box" });
+      else if (!box) unresolved.push({ key, reason: "target has no bounding box" });
       else {
         const visible = intersect(box, frameBox);
         if (!visible) unresolved.push({ key, reason: "target outside frame" });
-        else resolved.push({ index: i, key, targetId: c.targetId, text: c.text, node, box: visible });
+        else resolved.push({ index: i, key, targetId: c.targetId, text: c.text, node, box: visible, inInstance: inInstance(node, frame) });
       }
     }
     const obstacles = [];
@@ -10806,6 +10895,9 @@ Processing annotation ${i + 1}/${annotations.length}:`,
         { x: s.x - FAR, y: s.y + s.height, width: s.width + 2 * FAR, height: FAR }
       );
     }
+    const overhang = collectOverhang(frame, frameBox);
+    if (overhang.truncated) warnings.push(`frame content was only scanned for the first ${OVERHANG_SCAN_LIMIT} nodes: content past that point is not checked for overlap with labels`);
+    obstacles.push(...overhang.boxes);
     const mode = calloutMode(resolved.length, denseThreshold);
     const leaders = mode === "leaders" ? await resolveLeaderStyle(params.leaderStyle) : { style: "vector", template: null };
     const created = [];
@@ -10896,7 +10988,7 @@ Processing annotation ${i + 1}/${annotations.length}:`,
         tagged(label, r.key, "label", r.targetId);
         placedLabels.set(r.key, label);
         const entry = { key: r.key, rail: p.rail, x: p.label.x - frameBox.x, y: p.label.y - frameBox.y, labelId: label.id };
-        if (p.leader && leaders.style === "connector") {
+        if (p.leader && leaders.style === "connector" && !r.inInstance) {
           let connector = prev.leader && prev.leader.type === "CONNECTOR" ? touch(prev.leader) : null;
           if (connector) wireConnector(connector, r.key, label.id, p.rail, r.targetId);
           else {
@@ -11052,6 +11144,10 @@ Processing annotation ${i + 1}/${annotations.length}:`,
         labelsWritten = {};
         for (const p of layout.placed) {
           const r = resolved[p.index];
+          if (r.inInstance) {
+            annotations.skipped.push({ key: r.key, reason: "target is inside an instance: annotations cannot be attached to instance sublayers" });
+            continue;
+          }
           if (!("annotations" in r.node)) {
             annotations.skipped.push({ key: r.key, reason: `${r.node.type} does not support annotations` });
             continue;
@@ -11090,7 +11186,7 @@ Processing annotation ${i + 1}/${annotations.length}:`,
         rerun: ex ? { updated: placed.filter((p) => old(p.key).label).length, hidden, superseded } : null,
         annotations: native ? annotations : null,
         warnings,
-        verification: verify(layout, railNodes, placedLabels, frameBox, obstacles, group, sectionBox)
+        verification: verifyPlacement(layout, railNodes, placedLabels, frameBox, obstacles, overhang.boxes, group, sectionBox)
       };
     } catch (error) {
       const left = [];
@@ -11123,9 +11219,10 @@ Processing annotation ${i + 1}/${annotations.length}:`,
       throw new Error(`${message} (rolled back: removed ${removed} new layer${removed === 1 ? "" : "s"}, restored ${journal.size - left.filter((l) => l.includes("not restored")).length}${left.length ? `; left behind: ${left.join("; ")}` : ""})`);
     }
   }
-  function verify(layout, railNodes, labels, frameBox, obstacles, group, sectionBox) {
+  function verifyPlacement(layout, railNodes, labels, frameBox, obstacles, content, group, sectionBox) {
     const problems = [];
     const overlaps = (a, b) => a.x < b.x + b.width - 0.5 && b.x < a.x + a.width - 0.5 && a.y < b.y + b.height - 0.5 && b.y < a.y + a.height - 0.5;
+    const measured = [];
     for (const p of layout.placed) {
       const label = labels.get(p.key);
       const actual = label ? boxOf(label) : null;
@@ -11139,11 +11236,109 @@ Processing annotation ${i + 1}/${annotations.length}:`,
       }
       if (boxOverflow(rail, actual)) problems.push(`${p.key}: label outside rail/${p.rail}`);
       if (overlaps(actual, frameBox)) problems.push(`${p.key}: label overlaps the frame`);
-      if (obstacles.some((o) => overlaps(actual, o))) problems.push(`${p.key}: label overlaps a sibling or leaves the section`);
+      if (content.some((o) => overlaps(actual, o))) problems.push(`${p.key}: label overlaps content of the frame that extends past its bounds`);
+      else if (obstacles.some((o) => overlaps(actual, o))) problems.push(`${p.key}: label overlaps a sibling or leaves the section`);
+      measured.push({ key: p.key, box: actual });
+    }
+    for (let a = 0; a < measured.length; a++) {
+      for (let b = a + 1; b < measured.length; b++) {
+        if (overlaps(measured[a].box, measured[b].box)) problems.push(`${measured[a].key}: label overlaps the label of ${measured[b].key}`);
+      }
     }
     const groupBox = group ? boxOf(group) : null;
     if (groupBox && sectionBox && boxOverflow(sectionBox, groupBox)) problems.push("callout group is not contained in its section");
     return { ok: problems.length === 0, problems };
+  }
+
+  // src/llm2figma_plugin/src/undo-ledger.ts
+  var MAX_LEDGER = 50;
+  var READ_ONLY_COMMANDS = /* @__PURE__ */ new Set([
+    "notify",
+    "get_document_info",
+    "get_selection",
+    "get_node_info",
+    "get_nodes_info",
+    "read_my_design",
+    "assert_contained",
+    "snapshot_positions",
+    "diff_positions",
+    "export_spec",
+    "read_spec_nodes",
+    "get_styles",
+    "get_local_components",
+    "export_node_as_image",
+    "scan_text_nodes",
+    "get_annotations",
+    "scan_nodes_by_types",
+    "get_instance_overrides",
+    "get_reactions",
+    "set_focus",
+    "set_selections",
+    "get_local_variables",
+    "get_library_variables",
+    "get_vector_network",
+    "scan_node_styles",
+    "introspect_node",
+    "design_query",
+    "diff_components",
+    "get_interactions",
+    "get_flows",
+    "get_dev_resources",
+    "get_measurements",
+    "subscribe_events",
+    "unsubscribe_events",
+    "undo"
+  ]);
+  var UNCERTAIN_COMMANDS = /* @__PURE__ */ new Set(["figma_eval", "screenshot_region"]);
+  var ledger = [];
+  var seq = 0;
+  function commitUndo() {
+    const f = figma;
+    if (typeof f.commitUndo === "function") f.commitUndo();
+  }
+  function isTracked(command) {
+    return !READ_ONLY_COMMANDS.has(command);
+  }
+  function beginCommand(command) {
+    if (isTracked(command)) commitUndo();
+  }
+  function endCommand(command, failed) {
+    if (!isTracked(command)) return;
+    commitUndo();
+    const maybeNoop = UNCERTAIN_COMMANDS.has(command);
+    ledger.push({
+      seq: ++seq,
+      command,
+      uncertain: failed || maybeNoop,
+      reason: failed ? "the call failed and may have written part of its changes" : maybeNoop ? "this command may not have written anything" : ""
+    });
+    if (ledger.length > MAX_LEDGER) ledger = ledger.slice(ledger.length - MAX_LEDGER);
+  }
+  function undoLastCalls(count, allowUncertain) {
+    const n = Math.floor(count);
+    if (!(n >= 1)) throw new Error("count must be a whole number of at least 1");
+    if (ledger.length === 0) {
+      throw new Error("Nothing to undo: this plugin session has not recorded a write call. Undo is limited to calls made since the plugin started; use Cmd/Ctrl+Z in Figma for anything older.");
+    }
+    if (n > ledger.length) {
+      throw new Error(`Cannot undo ${n} calls: only ${ledger.length} write call(s) are recorded. Undo will not reach into earlier history, because that would revert changes that were not part of those calls.`);
+    }
+    const range = ledger.slice(ledger.length - n);
+    const uncertain = range.filter((e) => e.uncertain);
+    if (uncertain.length > 0 && !allowUncertain) {
+      const list = uncertain.map((e) => `${e.command} (${e.reason})`).join("; ");
+      throw new Error(`Undo refused: it cannot tell how many history steps these call(s) produced: ${list}. Nothing was undone. Inspect the document, then repeat with allowUncertain: true to revert one step per call, or fix the affected nodes directly.`);
+    }
+    commitUndo();
+    for (let i = 0; i < n; i++) figma.triggerUndo();
+    ledger = ledger.slice(0, ledger.length - n);
+    return {
+      success: true,
+      steps: n,
+      reverted: range.map((e) => e.command).reverse(),
+      uncertain: uncertain.length,
+      remaining: ledger.length
+    };
   }
 
   // src/llm2figma_plugin/src/events.ts
@@ -11350,7 +11545,15 @@ ${detail}`);
       case "execute-command":
         setPluginOperationGuard(true);
         try {
-          const result = await handleCommand(msg.command, msg.params);
+          beginCommand(msg.command);
+          let result;
+          try {
+            result = await handleCommand(msg.command, msg.params);
+          } catch (error) {
+            endCommand(msg.command, true);
+            throw error;
+          }
+          endCommand(msg.command, false);
           figma.ui.postMessage({
             type: "command-result",
             id: msg.id,
@@ -11533,8 +11736,7 @@ ${detail}`);
         return await setSelections(params);
       case "undo": {
         const undoSteps = Math.min(Math.max(params && params.count || 1, 1), 50);
-        for (let i = 0; i < undoSteps; i++) figma.triggerUndo();
-        return { success: true, steps: undoSteps };
+        return undoLastCalls(undoSteps, !!(params && params.allowUncertain));
       }
       case "set_font_family":
         return await setFontFamily(params);

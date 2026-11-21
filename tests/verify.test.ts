@@ -372,6 +372,33 @@ describe("snapshot_positions and diff_positions", () => {
     expect(small.snapshotId).toMatch(/^snap-/);
   });
 
+  test("a truncated snapshot says so in words and names the parents it stopped inside", async () => {
+    const root = makeNode("FRAME", { width: 500, height: 500 });
+    const a = makeNode("FRAME", { width: 50, height: 50 }, root);
+    for (let i = 0; i < 4; i++) makeNode("RECTANGLE", { x: i * 10 }, a);
+    const small: any = await snapshotPositions({ nodeId: root.id, maxNodes: 3 });
+    expect(small.truncated).toBe(true);
+    expect(small.note).toContain("Truncated: this snapshot recorded 3 nodes");
+    expect(small.note).toContain("budget 3 nodes");
+    expect(small.unreadParents).toEqual([a.id]);
+    expect(small.unreadParentCount).toBe(1);
+    // A complete snapshot carries none of this.
+    const full: any = await snapshotPositions({ nodeId: root.id });
+    expect(full.truncated).toBe(false);
+    expect(full.note).toBeUndefined();
+    expect(full.unreadParents).toBeUndefined();
+  });
+
+  test("a tree past the budget is truncated at the most the walk can take, not silently", async () => {
+    const root = makeNode("FRAME", { width: 500, height: 500 });
+    for (let i = 0; i < 10050; i++) makeNode("RECTANGLE", { x: i }, root);
+    const big: any = await snapshotPositions({ nodeId: root.id, maxNodes: 99999 });
+    expect(big.count).toBe(10000);
+    expect(big.truncated).toBe(true);
+    expect(big.note).toContain("the most it can take is 10000");
+    expect(big.unreadParents).toEqual([root.id]);
+  });
+
   test("an unknown snapshot id is 'snapshot expired', never an empty diff", async () => {
     await expect(diffPositions({ snapshotId: "snap-999-x" })).rejects.toThrow("Snapshot expired");
     await expect(assertContained({ parentId: makeNode("FRAME").id, expected: "snap-999-x" })).rejects.toThrow("Snapshot expired");

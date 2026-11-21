@@ -1065,7 +1065,6 @@ export async function setFlows(params: {
 
   // Validate every flow before writing anything.
   const seenNodes = new Set<string>();
-  const seenNames = new Set<string>();
   const rejected = [];
   const kept = [];
   const dropped = [];
@@ -1075,13 +1074,12 @@ export async function setFlows(params: {
       dropped.push({ name: flow.name, nodeId: flow.nodeId });
       continue;
     }
-    const problem = seenNames.has(flow.name)
-      ? "flow name used more than once"
-      : seenNodes.has(flow.nodeId)
-        ? "listed more than once"
-        : flowStartProblem(node, page);
+    // Flows are identified by their starting node id. Figma lets several
+    // starting points share a name, so a repeated name is not a problem.
+    const problem = seenNodes.has(flow.nodeId)
+      ? "listed more than once"
+      : flowStartProblem(node, page);
     seenNodes.add(flow.nodeId);
-    seenNames.add(flow.name);
     if (problem) rejected.push(`${flow.name} (${flow.nodeId}): ${problem}`);
     else kept.push({ name: flow.name, nodeId: flow.nodeId });
   }

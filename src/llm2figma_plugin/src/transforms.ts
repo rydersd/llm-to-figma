@@ -4,6 +4,39 @@
 import { sendProgressUpdate, generateCommandId, delay } from './utils';
 import { resizeWithReadBack } from './verify';
 
+/**
+ * Copy componentPropertyReferences (text characters, visibility, instance swap
+ * bindings) from a source subtree onto its clone, matching nodes by child path.
+ * A clone placed in a component set comes back with these bindings empty, so
+ * instances swapped to it lose their overrides. Call this AFTER the clone is
+ * in its final parent: the property definitions live on the set. Instances are
+ * not entered (their inner nodes have no bindings of their own).
+ */
+export function copyComponentPropertyReferences(source: any, clone: any) {
+  const result = { copied: 0, failed: [] as Array<{ path: number[]; error: string }> };
+  const walk = (s: any, c: any, path: number[]) => {
+    const refs = s && s.componentPropertyReferences;
+    if (refs && Object.keys(refs).length > 0) {
+      const have = (c && c.componentPropertyReferences) || {};
+      const missing = Object.keys(refs).some(k => have[k] !== refs[k]);
+      if (missing) {
+        try {
+          c.componentPropertyReferences = Object.assign({}, have, refs);
+          result.copied++;
+        } catch (error: any) {
+          result.failed.push({ path: path.slice(), error: error && error.message ? error.message : String(error) });
+        }
+      }
+    }
+    if (s && c && s.type !== "INSTANCE" && Array.isArray(s.children) && Array.isArray(c.children)) {
+      const n = Math.min(s.children.length, c.children.length);
+      for (let i = 0; i < n; i++) walk(s.children[i], c.children[i], path.concat(i));
+    }
+  };
+  walk(source, clone, []);
+  return result;
+}
+
 export async function moveNode(params: any) {
   const { nodeId, x, y } = params || {};
 
@@ -346,6 +379,8 @@ export async function cloneNode(params: any) {
     }
   }
 
+  const refs = copyComponentPropertyReferences(node, clone);
+
   return {
     id: clone.id,
     name: clone.name,
@@ -353,6 +388,9 @@ export async function cloneNode(params: any) {
     y: "y" in clone ? (clone as any).y : undefined,
     width: "width" in clone ? (clone as any).width : undefined,
     height: "height" in clone ? (clone as any).height : undefined,
+    ...(refs.copied > 0 || refs.failed.length > 0
+      ? { componentPropertyReferencesCopied: refs.copied, componentPropertyReferencesFailed: refs.failed }
+      : {}),
   };
 }
 
@@ -414,11 +452,16 @@ export async function batchClone(params: any) {
 
       parent.appendChild(clone);
 
+      const refs = copyComponentPropertyReferences(node, clone);
+
       clones.push({
         id: clone.id,
         name: clone.name,
         x: "x" in clone ? (clone as any).x : undefined,
         y: "y" in clone ? (clone as any).y : undefined,
+        ...(refs.copied > 0 || refs.failed.length > 0
+          ? { componentPropertyReferencesCopied: refs.copied, componentPropertyReferencesFailed: refs.failed }
+          : {}),
       });
       successCount++;
     } catch (error: any) {

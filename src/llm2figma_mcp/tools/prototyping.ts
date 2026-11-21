@@ -246,7 +246,7 @@ export function registerFlowTools(server: McpServer, sendCommandToFigma: SendCom
 
   server.tool(
     "set_flows",
-    "Replace all prototype flows on a page. The list is assigned whole, so running the same call twice gives the same page, and an empty list clears them. Every node must be a top-level frame on that page (directly on the page or inside sections only) and every flow name unique; otherwise nothing is written and the bad ones are listed. A flow whose starting frame does not exist is refused, unless dropMissing is true: then it is left out and listed in dropped. The background is optional: one solid colour (background), or the exact paints from get_flows (backgroundPaints); null or omitted leaves it alone. The prototype device cannot be set from the plugin API.",
+    "Replace all prototype flows on a page. The list is assigned whole, so running the same call twice gives the same page, and an empty list clears them. Every node must be a top-level frame on that page (directly on the page or inside sections only) and listed once; flows are identified by nodeId, so several flows may share a name. Otherwise nothing is written and the bad ones are listed. A flow whose starting frame does not exist is refused, unless dropMissing is true: then it is left out and listed in dropped. The background is optional: one solid colour (background), or the exact paints from get_flows (backgroundPaints); null or omitted leaves it alone. The prototype device cannot be set from the plugin API.",
     {
       pageId: z.string().min(1).describe("The page whose flows are replaced"),
       flows: z.array(z.object({

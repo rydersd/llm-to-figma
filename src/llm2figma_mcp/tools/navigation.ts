@@ -38,13 +38,15 @@ export function registerTools(
     }
   });
 
-  server.tool("undo", "Undo the last action(s) in Figma. Use after destructive operations like rasterizing images at wrong sizes, accidental deletions, or batch mutations that produced wrong results.", {
-    count: z.number().int().min(1).max(50).optional().describe("Number of undo steps (default 1, max 50)"),
-  }, async ({ count }: any) => {
+  server.tool("undo", "Undo the last tool call(s) that wrote to the file. Figma's history knows nothing about tool calls, so the plugin closes a history step around every write call and keeps a ledger of them (this plugin session only). count = number of recent write calls to revert, one history step each. It refuses, changing nothing, when count exceeds the recorded calls, or when a call in range may not have produced exactly one step: a call that failed part-way, figma_eval, screenshot_region. It cannot see hand edits made in Figma between calls, or a call that wrote nothing, and it cannot be proven exact without checking: run snapshot_positions before and diff_positions after. allowUncertain: true overrides the refusal for failed or uncertain calls. Returns the commands reverted.", {
+    count: z.number().int().min(1).max(50).optional().describe("Number of recent write calls to revert (default 1, max 50)"),
+    allowUncertain: z.boolean().optional().describe("Revert one step per call even when a call in range failed part-way or may not have written (default false: refuse)"),
+  }, async ({ count, allowUncertain }: any) => {
     try {
       const steps = count || 1;
-      await sendCommandToFigma("undo", { count: steps });
-      return { content: [{ type: "text", text: `Undo triggered ${steps} time(s)` }] };
+      const result: any = await sendCommandToFigma("undo", { count: steps, allowUncertain: !!allowUncertain });
+      const reverted = Array.isArray(result?.reverted) ? result.reverted.join(", ") : "";
+      return { content: [{ type: "text", text: `Undid ${steps} write call(s)${reverted ? `: ${reverted}` : ""}` }] };
     } catch (error) {
       return { content: [{ type: "text", text: `Error triggering undo: ${error instanceof Error ? error.message : String(error)}` }] };
     }

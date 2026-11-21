@@ -7,7 +7,7 @@
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { z } from "zod";
-import { annotationKey, annotationMarkdown, FACING_MAGNET, NO_CONNECTOR_TEMPLATE, placeCallouts, upsertAnnotation } from "../src/llm2figma_plugin/src/callouts";
+import { annotationKey, annotationMarkdown, FACING_MAGNET, NO_CONNECTOR_TEMPLATE, placeCallouts, upsertAnnotation, verifyPlacement } from "../src/llm2figma_plugin/src/callouts";
 import { assertEditorAllowed } from "../src/llm2figma_plugin/src/editor-gate";
 import { registerTools } from "../src/llm2figma_mcp/tools/callouts";
 import { registerWhenEnabled } from "../src/shared/flags";
@@ -645,15 +645,39 @@ describe("review fixes", () => {
     expect(before.length + 1).toBe(beforeWithExtra.length);
   });
 
-  test("a target inside an instance is refused before anything changes", async () => {
+  // A sublayer of an instance has an id like "I12:1;3:4".
+  const instanceChild = () => {
     const instance = child(frame, "INSTANCE", "Button", 100, 100, 80, 30);
     const inner = child(instance, "TEXT", "Label", 4, 4, 40, 12);
-    const before = tree(page);
-    await expect(placeCallouts({ frameId: frame.id, callouts: [CALLOUTS[0], { targetId: inner.id, text: "x" }] }))
-      .rejects.toThrow(`target ${inner.id} is inside an instance`);
-    expect(tree(page)).toEqual(before);
-    // The instance itself is a fine target.
-    expect((await placeCallouts({ frameId: frame.id, callouts: [{ targetId: instance.id, text: "x" }], leaderStyle: "vector" })).placed).toHaveLength(1);
+    nodes.delete(inner.id);
+    inner.id = "I100:1;200:2";
+    nodes.set(inner.id, inner);
+    return { instance, inner };
+  };
+
+  test("a target inside an instance is placed by its box, with a drawn leader and no native annotation", async () => {
+    const { instance, inner } = instanceChild();
+    const result = await placeCallouts({ frameId: frame.id, callouts: [CALLOUTS[0], { targetId: inner.id, text: "x" }] });
+    expect(result.overflow).toEqual([]);
+    expect(result.placed.map((p: any) => p.key)).toEqual(["5:1", inner.id]);
+    expect(result.verification).toEqual({ ok: true, problems: [] });
+    expect(named(page, `leader/${inner.id}`)[0].type).toBe("VECTOR");
+    expect(named(page, `dot/${inner.id}`)).toHaveLength(1);
+    expect(result.annotations.skipped).toEqual([{ key: inner.id, reason: expect.stringContaining("inside an instance") }]);
+    expect(result.annotations.added).toBe(1);
+    // The instance itself is still a fine target.
+    const own = await placeCallouts({ frameId: frame.id, callouts: [{ targetId: instance.id, text: "x" }], leaderStyle: "vector" });
+    expect(own.placed).toHaveLength(1);
+  });
+
+  test("with connector leaders, only the instance target gets a drawn leader", async () => {
+    makeConnector(page);
+    const { inner } = instanceChild();
+    const result = await placeCallouts({ frameId: frame.id, callouts: [CALLOUTS[0], { targetId: inner.id, text: "x" }] });
+    expect(result.leaderStyle).toBe("connector");
+    expect(named(page, "leader/5:1")[0].type).toBe("CONNECTOR");
+    expect(named(page, `leader/${inner.id}`)[0].type).toBe("VECTOR");
+    expect(result.overflow).toEqual([]);
   });
 
   test("a connector that cannot go in the group is archived beside it: hidden, renamed and reported", async () => {
@@ -702,5 +726,62 @@ describe("review fixes", () => {
     for (const n of named(group, "").filter((n: any) => n.type !== "TEXT")) {
       expect(JSON.parse(n.getPluginData("l2f-callout")).frameId).toBe(frame.id);
     }
+  });
+});
+
+describe("verification", () => {
+  const box = (x: number, y: number, width: number, height: number) => ({ absoluteBoundingBox: { x, y, width, height } });
+  const placed = (key: string, x: number, y: number) => ({ key, index: 0, rail: "left" as const, label: { x, y, width: 240, height: 40 } });
+  const layout = (...p: any[]) => ({ mode: "leaders" as const, placed: p, overflow: [], rails: {} });
+  const frameBox = { x: 600, y: 0, width: 400, height: 600 };
+  const rail = box(312, 0, 240, 600);
+
+  test("two labels that overlap on the canvas are reported, even though each is where it was planned", () => {
+    // Planned where they are, but the boxes Figma reports reach into each other.
+    const labels = new Map<string, any>([["a", box(312, 100, 240, 40)], ["b", box(312, 130, 240, 40)]]);
+    const result = verifyPlacement(layout(placed("a", 312, 100), placed("b", 312, 130)), { left: rail }, labels, frameBox, [], [], null, null);
+    expect(result.ok).toBe(false);
+    expect(result.problems).toEqual(["a: label overlaps the label of b"]);
+  });
+
+  test("labels that only touch or sit apart are fine", () => {
+    const labels = new Map<string, any>([["a", box(312, 100, 240, 40)], ["b", box(312, 140, 240, 40)], ["c", box(312, 200, 240, 12)]]);
+    const result = verifyPlacement(layout(placed("a", 312, 100), placed("b", 312, 140), placed("c", 312, 200)), { left: rail }, labels, frameBox, [], [], null, null);
+    expect(result).toEqual({ ok: true, problems: [] });
+  });
+
+  test("a label over frame content that extends past the frame is reported", () => {
+    const labels = new Map<string, any>([["a", box(312, 100, 240, 40)]]);
+    const overhang = [{ x: 500, y: 90, width: 120, height: 80 }];
+    const result = verifyPlacement(layout(placed("a", 312, 100)), { left: rail }, labels, frameBox, overhang, overhang, null, null);
+    expect(result.ok).toBe(false);
+    expect(result.problems).toEqual(["a: label overlaps content of the frame that extends past its bounds"]);
+  });
+
+  test("content overhanging the frame is an obstacle: labels keep clear of it and verification passes", async () => {
+    // A child of the frame reaching 60px past its left edge, level with the first target.
+    child(frame, "RECTANGLE", "Bleed", -60, 40, 100, 50);
+    const result = await placeCallouts({ frameId: frame.id, callouts: CALLOUTS, leaderStyle: "vector" });
+    expect(result.verification).toEqual({ ok: true, problems: [] });
+    const bleed = { x: 1540, y: 840, width: 100, height: 50 };
+    for (const label of named(nodes.get(result.groupId), "callout/").filter((n: any) => n.type === "FRAME")) {
+      const b = label.absoluteBoundingBox;
+      expect(b.x < bleed.x + bleed.width && bleed.x < b.x + b.width && b.y < bleed.y + bleed.height && bleed.y < b.y + b.height).toBe(false);
+    }
+  });
+
+  test("a full run reports overlapping labels when a label has moved since layout", async () => {
+    const first = await placeCallouts({ frameId: frame.id, callouts: CALLOUTS, leaderStyle: "vector", rails: ["left"] });
+    expect(first.verification.ok).toBe(true);
+    const group = nodes.get(first.groupId);
+    const labels = named(group, "callout/").filter((n: any) => n.type === "FRAME");
+    const [a, b] = [labels[0], labels[1]];
+    const planned = [a, b].map((l: any) => ({ ...l.absoluteBoundingBox }));
+    b.y = a.y + 5; // a stale layout would leave it here
+    const result = verifyPlacement(
+      { mode: "leaders", placed: [{ key: "a", index: 0, rail: "left", label: planned[0] }, { key: "b", index: 1, rail: "left", label: b.absoluteBoundingBox }], overflow: [], rails: {} },
+      { left: group.children.find((c: any) => c.name === "rail/left") }, new Map([["a", a], ["b", b]]), frame.absoluteBoundingBox, [], [], null, null,
+    );
+    expect(result.problems).toContain("a: label overlaps the label of b");
   });
 });

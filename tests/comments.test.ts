@@ -222,6 +222,27 @@ describe("formatComments", () => {
     expect(all.find((c) => c.id === "201")?.resolved).toBe("2026-11-04T10:00:00Z");
   });
 
+  test("the result says which set it holds, and how many resolved comments an open-only list left out", () => {
+    const open = formatComments(COMMENTS);
+    expect(open.returned).toBe("open comments only");
+    expect(open.resolvedOmitted).toBe(2);
+    const everything = formatComments(COMMENTS, { includeResolved: true });
+    expect(everything.returned).toBe("open and resolved comments");
+    expect(everything.resolvedOmitted).toBeUndefined();
+    expect(everything.total).toBe(5);
+  });
+
+  test("get_comments with includeResolved returns resolved threads and labels the set", async () => {
+    const { fn } = fakeFetch(() => json({ comments: COMMENTS }));
+    const tools = capture((s) => registerReadTools(s, noSend, deps(fn)));
+    const open = JSON.parse(textOf(await tools.get_comments.run({ fileKey: KEY })));
+    expect(open.returned).toBe("open comments only");
+    expect(open.resolvedOmitted).toBe(2);
+    const all = JSON.parse(textOf(await tools.get_comments.run({ fileKey: KEY, includeResolved: true })));
+    expect(all.returned).toBe("open and resolved comments");
+    expect(all.comments.map((c: any) => c.id)).toEqual(["100", "200", "101", "201", "300"]);
+  });
+
   test("compact fields; replies inherit the root's node pin; Vector pins have none", () => {
     const all = formatComments(COMMENTS, { includeResolved: true }).comments;
     expect(all.find((c) => c.id === "100")).toEqual({
