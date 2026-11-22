@@ -102,6 +102,27 @@ Or add it to a project's `.mcp.json`:
 }
 ```
 
+### MCP Server: Integration with Codex
+
+Codex runs the same local server. From the repo root:
+
+```bash
+codex mcp add LLM2Figma --env L2F_ALL=1 -- "$(command -v bun)" "$PWD/src/llm2figma_mcp/server.ts"
+```
+
+Some calls take longer than Codex's default 60-second tool timeout: `figma_eval` can run for up to 120 seconds and `create_node_tree` for up to 60. Raise the timeout in `~/.codex/config.toml`, in the `[mcp_servers.LLM2Figma]` table the command created:
+
+```toml
+tool_timeout_sec = 180
+```
+
+Check it with `codex mcp list`. Then start Codex, run the llm2figma plugin in Figma and click Connect. With one file connected the tools join it on their own; with several, give Codex the channel shown in the plugin.
+
+- **The relay is shared.** Claude Code and Codex both use the relay on port 3055. Whichever starts first launches it, and the other reuses it.
+- **The Figma token is read from the macOS Keychain,** as it is for Claude Code. Add `--env FIGMA_LIBRARY_FILE_KEYS=<keys>` to the add command if you use the team library tools.
+- **Feature flags are optional.** `--env L2F_ALL=1` turns on the flagged tools (see below); leave it out for the standard set.
+- **`bun setup` only writes Claude Code's config.** If you move the repo, run `codex mcp remove LLM2Figma` and add the server again with the new path.
+
 ### Feature flags (`L2F_ALL`)
 
 New tool families ship behind server-side flags. A tool whose flag is off is not registered, so it doesn't appear in Claude's tool list. The server reads flags only from its own environment when it starts; no tool parameter or client-sent value can turn one on.
