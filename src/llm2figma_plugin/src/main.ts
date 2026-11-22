@@ -20,6 +20,7 @@ import { setDevStatus, getDevResources, addDevResource, addMeasurement, getMeasu
 import { exportSpec, readSpecNodes } from './spec';
 import { applySpecOps } from './spec-apply';
 import { placeCallouts } from './callouts';
+import { beginCommand, endCommand, undoLastCalls } from './undo-ledger';
 import { startEventStreaming, stopEventStreaming, setPluginOperationGuard } from './events';
 
 // Plugin state
@@ -96,7 +97,15 @@ figma.ui.onmessage = async (msg: any) => {
       // Wrap in plugin operation guard so event listeners can tag self-caused events
       setPluginOperationGuard(true);
       try {
-        const result = await handleCommand(msg.command, msg.params);
+        beginCommand(msg.command);
+        let result: any;
+        try {
+          result = await handleCommand(msg.command, msg.params);
+        } catch (error) {
+          endCommand(msg.command, true);
+          throw error;
+        }
+        endCommand(msg.command, false);
         // Send result back to UI
         figma.ui.postMessage({
           type: "command-result",
@@ -307,8 +316,7 @@ async function handleCommand(command: string, params: any) {
       return await setSelections(params);
     case "undo": {
       const undoSteps = Math.min(Math.max((params && params.count) || 1, 1), 50);
-      for (let i = 0; i < undoSteps; i++) figma.triggerUndo();
-      return { success: true, steps: undoSteps };
+      return undoLastCalls(undoSteps, !!(params && params.allowUncertain));
     }
     case "set_font_family":
       return await setFontFamily(params);

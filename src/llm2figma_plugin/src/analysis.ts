@@ -1017,11 +1017,25 @@ export async function optimizeStructure(params: any) {
   };
 }
 
+// Every match is held in plugin memory until the walk ends, and each one becomes
+// a result record (with a full property introspection when includeProperties is
+// set). Past these counts the call stops with an error instead of building a
+// result large enough to stall or crash the plugin.
+export const DESIGN_QUERY_MAX_MATCHES = 1000;
+export const DESIGN_QUERY_MAX_PROPERTY_MATCHES = 200;
+export const DESIGN_QUERY_TIMEOUT_MS = 120000;
+
 export async function designQuery(params: any) {
   var select = params.select;
   var update = params.update;
   var limit = params.limit;
   var includeProperties = params.includeProperties === true;
+  var matchCap = includeProperties ? DESIGN_QUERY_MAX_PROPERTY_MATCHES : DESIGN_QUERY_MAX_MATCHES;
+  if (limit && limit > matchCap) {
+    throw new Error("design_query limit " + limit + " is above the most one call returns" + (includeProperties ? " with includeProperties" : "") + " (" + matchCap + "). Lower the limit, or narrow select (parentId, type) and query in parts.");
+  }
+  // One past the cap is enough to know the cap was exceeded.
+  var walkLimit = limit || matchCap + 1;
 
   // Determine root
   var rootNode: any;
@@ -1063,12 +1077,12 @@ export async function designQuery(params: any) {
   var matches: any[] = [];
   var totalScanned = 0;
   var startTime = Date.now();
-  var TIMEOUT_MS = 120000;
+  var timedOut = false;
 
   async function walkTree(node: any, depth: any) {
     if (depth > maxDepth) return;
-    if (limit && matches.length >= limit) return;
-    if (Date.now() - startTime > TIMEOUT_MS) return;
+    if (matches.length >= walkLimit) return;
+    if (Date.now() - startTime > DESIGN_QUERY_TIMEOUT_MS) { timedOut = true; return; }
 
     totalScanned++;
 
@@ -1146,7 +1160,7 @@ export async function designQuery(params: any) {
       }
 
       if (passed && depth > 0) {
-        if (!limit || matches.length < limit) {
+        if (matches.length < walkLimit) {
           matches.push(node);
         }
       }
@@ -1155,13 +1169,21 @@ export async function designQuery(params: any) {
     // Recurse into children
     if ("children" in node && node.children) {
       for (var i = 0; i < node.children.length; i++) {
-        if (limit && matches.length >= limit) break;
+        if (matches.length >= walkLimit) break;
         await walkTree(node.children[i], depth + 1);
       }
     }
   }
 
   await walkTree(rootNode, 0);
+
+  // Nothing has been written yet: refuse before building records or applying updates.
+  if (!limit && matches.length > matchCap) {
+    throw new Error("design_query matched more than " + matchCap + " nodes" + (includeProperties ? " with includeProperties" : "") + ". Pass a limit, or narrow select (parentId, type, name) and query in parts.");
+  }
+  if (timedOut && update) {
+    throw new Error("design_query ran out of time after scanning " + totalScanned + " nodes, so no update was applied. Narrow select (parentId, type) and run it in parts.");
+  }
 
   // Process results
   var results: any[] = [];
@@ -1215,15 +1237,29 @@ export async function designQuery(params: any) {
   return {
     totalScanned: totalScanned,
     matched: matches.length,
+    ...(timedOut ? { timedOut: true, note: "The scan hit its time limit; matches past the point reached are not listed." } : {}),
+    ...(limit && matches.length >= limit ? { limitReached: true } : {}),
     updated: update ? updatedCount : undefined,
     failed: update ? failedCount : undefined,
     results: results,
   };
 }
 
-export function safeSerialize(value: any, depth?: any): any {
+// What figma_eval may hand back in one call: values counted as they are
+// serialised, strings by length. Past either the call fails with an error that
+// says what to do, instead of posting a payload big enough to stall the plugin.
+export const EVAL_RESULT_MAX_VALUES = 50000;
+export const EVAL_RESULT_MAX_CHARS = 2000000;
+
+export interface SerializeBudget { values: number; chars: number }
+
+export function safeSerialize(value: any, depth?: any, budget?: SerializeBudget): any {
   if (depth === undefined) depth = 0;
   if (depth > 20) return "[max depth]";
+  if (budget) {
+    if (--budget.values < 0) throw new Error("figma_eval result is too large (more than " + EVAL_RESULT_MAX_VALUES + " values). Return counts, ids or a summary, or process the nodes in several calls.");
+    if (typeof value === "string" && (budget.chars -= value.length) < 0) throw new Error("figma_eval result is too large (more than " + EVAL_RESULT_MAX_CHARS + " characters of text). Return a summary, or read the text in several calls.");
+  }
   if (value === null || value === undefined) return value;
   var t = typeof value;
   if (t === "string" || t === "number" || t === "boolean") return value;
@@ -1235,12 +1271,12 @@ export function safeSerialize(value: any, depth?: any): any {
     return { __binary: true, length: value.length };
   }
   if (Array.isArray(value)) {
-    return value.map(function(item: any) { return safeSerialize(item, depth + 1); });
+    return value.map(function(item: any) { return safeSerialize(item, depth + 1, budget); });
   }
   if (t === "object") {
     var result: any = {};
     for (var key in value) {
-      if (value.hasOwnProperty(key)) result[key] = safeSerialize(value[key], depth + 1);
+      if (value.hasOwnProperty(key)) result[key] = safeSerialize(value[key], depth + 1, budget);
     }
     return result;
   }
@@ -1258,7 +1294,7 @@ export async function figmaEval(params: any) {
       loadAllFonts, getVariableByName, bindVariableToColor,
       resolveColorValue, sendProgressUpdate, introspectNode, setProperties,
       resizeWithReadBack);
-    return { success: true, result: safeSerialize(rawResult) };
+    return { success: true, result: safeSerialize(rawResult, 0, { values: EVAL_RESULT_MAX_VALUES, chars: EVAL_RESULT_MAX_CHARS }) };
   } catch (error: any) {
     return { success: false, error: formatError(error) };
   }

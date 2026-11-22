@@ -299,7 +299,7 @@ async function createBadge(n: number, box: Box, parent: any, born: Born): Promis
 
 // --- The command --------------------------------------------------------------
 
-interface Resolved { index: number; key: string; targetId: string; text: string; node: any; box: Box }
+interface Resolved { index: number; key: string; targetId: string; text: string; node: any; box: Box; inInstance: boolean }
 
 function validateParams(params: PlaceCalloutsParams) {
   if (!params || typeof params.frameId !== "string" || !params.frameId) throw new Error("Missing required parameter: frameId");
@@ -435,6 +435,28 @@ function inInstance(node: any, frame: any): boolean {
   return false;
 }
 
+export const OVERHANG_SCAN_LIMIT = 5000;
+
+// Boxes of visible nodes inside `frame` that reach past the frame's bounds.
+// Groups are walked, not collected: their box is the union of their children,
+// which would block a whole rail for one child's overhang.
+function collectOverhang(frame: any, frameBox: Box): { boxes: Box[]; truncated: boolean } {
+  const boxes: Box[] = [];
+  const stack: any[] = [...(frame.children || [])];
+  let scanned = 0;
+  while (stack.length) {
+    const n = stack.pop();
+    if (n.visible === false) continue;
+    if (++scanned > OVERHANG_SCAN_LIMIT) return { boxes, truncated: true };
+    if (n.type !== "GROUP" && n.type !== "BOOLEAN_OPERATION") {
+      const b = boxOf(n);
+      if (b && (b.x < frameBox.x - 0.5 || b.y < frameBox.y - 0.5 || b.x + b.width > frameBox.x + frameBox.width + 0.5 || b.y + b.height > frameBox.y + frameBox.height + 0.5)) boxes.push(b);
+    }
+    if (n.children) for (const c of n.children) stack.push(c);
+  }
+  return { boxes, truncated: false };
+}
+
 function intersect(a: Box, b: Box): Box | null {
   const x = Math.max(a.x, b.x), y = Math.max(a.y, b.y);
   const r = Math.min(a.x + a.width, b.x + b.width), btm = Math.min(a.y + a.height, b.y + b.height);
@@ -476,13 +498,14 @@ export async function placeCallouts(params: PlaceCalloutsParams): Promise<any> {
     const box = node ? boxOf(node) : null;
     if (!node) unresolved.push({ key, reason: "target not found" });
     else if (!isInside(node, frame)) unresolved.push({ key, reason: "target not in frame" });
-    else if (inInstance(node, frame)) {
-      throw new Error(`callout ${key}: target ${c.targetId} is inside an instance; point the callout at the instance itself (or detach it)`);
-    } else if (!box) unresolved.push({ key, reason: "target has no bounding box" });
+    else if (!box) unresolved.push({ key, reason: "target has no bounding box" });
     else {
       const visible = intersect(box, frameBox);
       if (!visible) unresolved.push({ key, reason: "target outside frame" });
-      else resolved.push({ index: i, key, targetId: c.targetId, text: c.text, node, box: visible });
+      // A target inside an instance (id I…;…) is placed by its box like any
+      // other. Only the parts that cannot attach to an instance sublayer change:
+      // its leader is drawn, not a connector, and it gets no native annotation.
+      else resolved.push({ index: i, key, targetId: c.targetId, text: c.text, node, box: visible, inInstance: inInstance(node, frame) });
     }
   }
 
@@ -506,6 +529,12 @@ export async function placeCallouts(params: PlaceCalloutsParams): Promise<any> {
       { x: s.x - FAR, y: s.y + s.height, width: s.width + 2 * FAR, height: FAR },
     );
   }
+
+  // The frame's own content that sticks out past its bounds (children of a
+  // frame that does not clip) is in the way of labels too.
+  const overhang = collectOverhang(frame, frameBox);
+  if (overhang.truncated) warnings.push(`frame content was only scanned for the first ${OVERHANG_SCAN_LIMIT} nodes: content past that point is not checked for overlap with labels`);
+  obstacles.push(...overhang.boxes);
 
   const mode = calloutMode(resolved.length, denseThreshold);
   // Numbered mode has no leaders, so it needs no connector template.
@@ -607,7 +636,7 @@ export async function placeCallouts(params: PlaceCalloutsParams): Promise<any> {
       tagged(label, r.key, "label", r.targetId);
       placedLabels.set(r.key, label);
       const entry: any = { key: r.key, rail: p.rail, x: p.label.x - frameBox.x, y: p.label.y - frameBox.y, labelId: label.id };
-      if (p.leader && leaders.style === "connector") {
+      if (p.leader && leaders.style === "connector" && !r.inInstance) {
         let connector = prev.leader && prev.leader.type === "CONNECTOR" ? touch(prev.leader) : null;
         if (connector) wireConnector(connector, r.key, label.id, p.rail, r.targetId);
         else {
@@ -763,6 +792,10 @@ export async function placeCallouts(params: PlaceCalloutsParams): Promise<any> {
       labelsWritten = {};
       for (const p of layout.placed) {
         const r = resolved[p.index];
+        if (r.inInstance) {
+          annotations.skipped.push({ key: r.key, reason: "target is inside an instance: annotations cannot be attached to instance sublayers" });
+          continue;
+        }
         if (!("annotations" in r.node)) {
           annotations.skipped.push({ key: r.key, reason: `${r.node.type} does not support annotations` });
           continue;
@@ -799,7 +832,7 @@ export async function placeCallouts(params: PlaceCalloutsParams): Promise<any> {
       rerun: ex ? { updated: placed.filter(p => old(p.key).label).length, hidden, superseded } : null,
       annotations: native ? annotations : null,
       warnings,
-      verification: verify(layout, railNodes, placedLabels, frameBox, obstacles, group, sectionBox),
+      verification: verifyPlacement(layout, railNodes, placedLabels, frameBox, obstacles, overhang.boxes, group, sectionBox),
     };
   } catch (error) {
     const left: string[] = [];
@@ -827,12 +860,13 @@ export async function placeCallouts(params: PlaceCalloutsParams): Promise<any> {
 // Read every placed box back from Figma (absoluteBoundingBox) and check it is
 // where the layout put it: labels in their rail, off the frame and obstacles,
 // the group within its section.
-function verify(
+export function verifyPlacement(
   layout: CalloutLayout, railNodes: Partial<Record<Rail, any>>, labels: Map<string, any>,
-  frameBox: Box, obstacles: Box[], group: any, sectionBox: Box | null,
+  frameBox: Box, obstacles: Box[], content: Box[], group: any, sectionBox: Box | null,
 ) {
   const problems: string[] = [];
   const overlaps = (a: Box, b: Box) => a.x < b.x + b.width - 0.5 && b.x < a.x + a.width - 0.5 && a.y < b.y + b.height - 0.5 && b.y < a.y + a.height - 0.5;
+  const measured: Array<{ key: string; box: Box }> = [];
   for (const p of layout.placed) {
     const label = labels.get(p.key);
     const actual = label ? boxOf(label) : null;
@@ -843,7 +877,16 @@ function verify(
     }
     if (boxOverflow(rail, actual)) problems.push(`${p.key}: label outside rail/${p.rail}`);
     if (overlaps(actual, frameBox)) problems.push(`${p.key}: label overlaps the frame`);
-    if (obstacles.some(o => overlaps(actual, o))) problems.push(`${p.key}: label overlaps a sibling or leaves the section`);
+    if (content.some(o => overlaps(actual, o))) problems.push(`${p.key}: label overlaps content of the frame that extends past its bounds`);
+    else if (obstacles.some(o => overlaps(actual, o))) problems.push(`${p.key}: label overlaps a sibling or leaves the section`);
+    measured.push({ key: p.key, box: actual });
+  }
+  // Labels against each other, on the boxes Figma reports now (a label whose
+  // text wrapped differently after layout is only caught here).
+  for (let a = 0; a < measured.length; a++) {
+    for (let b = a + 1; b < measured.length; b++) {
+      if (overlaps(measured[a].box, measured[b].box)) problems.push(`${measured[a].key}: label overlaps the label of ${measured[b].key}`);
+    }
   }
   const groupBox = group ? boxOf(group) : null;
   if (groupBox && sectionBox && boxOverflow(sectionBox, groupBox)) problems.push("callout group is not contained in its section");

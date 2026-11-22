@@ -197,10 +197,20 @@ describe("plugin getFlows / setFlows", () => {
     expect(page.flowStartingPoints).toEqual(FLOWS);
   });
 
-  test("duplicate flow names in one call are rejected with nothing written", async () => {
-    const error = await setFlows({ pageId: "0:1", flows: [{ name: "Same", nodeId: "1:1" }, { name: "Same", nodeId: "1:3" }] })
+  test("flows are addressed by node id: several flows may share a name", async () => {
+    const dup = [{ name: "Same", nodeId: "1:1" }, { name: "Same", nodeId: "1:3" }];
+    const result: any = await setFlows({ pageId: "0:1", flows: dup });
+    expect(page.flowStartingPoints).toEqual(dup);
+    expect(result.flows.map((f: any) => f.nodeId)).toEqual(["1:1", "1:3"]);
+    // Re-running with the read-back output is a no-op.
+    await setFlows({ pageId: "0:1", flows: result.flows });
+    expect(page.flowStartingPoints).toEqual(dup);
+  });
+
+  test("the same node id listed twice is still rejected with nothing written", async () => {
+    const error = await setFlows({ pageId: "0:1", flows: [{ name: "A", nodeId: "1:3" }, { name: "A", nodeId: "1:3" }] })
       .then(() => null, (e: Error) => e.message);
-    expect(error).toContain("Same (1:3): flow name used more than once");
+    expect(error).toContain("A (1:3): listed more than once");
     expect(flowWrites).toBe(0);
   });
 
